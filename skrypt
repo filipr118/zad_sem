@@ -1,1 +1,100 @@
+import arcpy
+import csv
+import os
 
+# =========================
+# PARAMETRY – ZMIENIASZ TUTAJ
+# =========================
+
+gdb = r"D:\Dokumenty\ArcGIS\Projects\zadanie_sem\zadanie_sem.gdb"   # ścieżka do geobazy z shapefile
+csv_out = r"D:\Dokumenty\ArcGIS\Projects\zadanie_sem\wynik_powiat.csv"  # wynikowy CSV
+
+arcpy.env.workspace = gdb
+arcpy.env.overwriteOutput = True
+
+# =========================
+# LISTY KLAS Z ROZPORZĄDZENIA
+# =========================
+
+PRZEPUSZCZALNE = [
+    "OT_PTLZ", "OT_PTRK", "OT_PTUT", "OT_PTTR", "OT_PTGN",
+    "OT_OIPR", "OT_TCON", "OT_TCPK", "OT_TCPN", "OT_TCRZ"
+]
+
+NIEPRZEPUSZCZALNE = [
+    "OT_PTZB", "OT_PTKM", "OT_PTPL", "OT_PTNZ", "OT_PTSO",
+    "OT_PTWZ", "OT_SKJZ", "OT_SKDR", "OT_SKRW", "OT_SKRP",
+    "OT_SKTR", "OT_SKPP", "OT_BUBD", "OT_BUIN", "OT_BUHD",
+    "OT_BUSP", "OT_BUWT", "OT_BUZT", "OT_BUUO", "OT_BUZM",
+    "OT_BUTR", "OT_BUIT", "OT_BUIB", "OT_KUMN", "OT_KUPG",
+    "OT_KUKO", "OT_KUSK", "OT_KUHO", "OT_KUHU", "OT_KUOS",
+    "OT_KUOZ", "OT_KUZA", "OT_KUSC", "OT_KUPW", "OT_OIKM",
+    "OT_OIOR"
+]
+
+WODA = [
+    "OT_SWRS", "OT_SWKN", "OT_SWRM", "OT_PTWP", "OT_OIMK", "OT_OISZ"
+]
+
+# =========================
+# TWORZENIE POJEDYNCZEJ GEOMETRII HIERARCHICZNEJ
+# =========================
+
+# kolejność hierarchii
+kategorie = [("WODA", WODA), ("NIEPRZEPUSZCZALNE", NIEPRZEPUSZCZALNE), ("PRZEPUSZCZALNE", PRZEPUSZCZALNE)]
+
+# pole dla kategorii
+temp_union = "in_memory/temp_union"
+arcpy.CreateFeatureclass_management("in_memory", "temp_union", "POLYGON", spatial_reference=arcpy.Describe(arcpy.ListFeatureClasses()[0]).spatialReference)
+arcpy.AddField_management(temp_union, "KATEGORIA", "TEXT", field_length=30)
+
+# lista wszystkich poligonów z przypisaną kategorią wg hierarchii
+for cat_name, lista in kategorie:
+    for fc in arcpy.ListFeatureClasses():
+        desc = arcpy.Describe(fc)
+        if desc.shapeType != "Polygon":
+            continue  # pomijamy nie-poligony
+        lname = os.path.basename(fc).upper()
+        if any(k in lname for k in lista):
+            # kopiujemy poligony do temp_union z polem KATEGORIA
+            arcpy.Append_management(inputs=fc, target=temp_union, schema_type="NO_TEST")
+            with arcpy.da.UpdateCursor(temp_union, ["KATEGORIA"]) as cursor:
+                for row in cursor:
+                    if row[0] in (None, ""):
+                        row[0] = cat_name
+                        cursor.updateRow(row)
+
+# =========================
+# Dissolve po kategorii, żeby nakładające się poligony były policzone raz
+# =========================
+
+dissolved = "in_memory/dissolved"
+arcpy.Dissolve_management(temp_union, dissolved, "KATEGORIA")
+
+# =========================
+# SUMOWANIE POWIERZCHNI
+# =========================
+
+suma = {"PRZEPUSZCZALNE": 0.0, "NIEPRZEPUSZCZALNE": 0.0, "WODA": 0.0}
+
+with arcpy.da.SearchCursor(dissolved, ["KATEGORIA", "SHAPE@"]) as cursor:
+    for row in cursor:
+        cat, geom = row
+        area_ha = geom.getArea("PLANAR", "SQUAREMETERS") / 10000.0
+        if cat in suma:
+            suma[cat] += area_ha
+
+pow_calk = sum(suma.values())
+
+# =========================
+# ZAPIS CSV (przecinek jako separator dziesiętny)
+# =========================
+
+with open(csv_out, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f, delimiter=";")
+    writer.writerow(["typ", "powierzchnia_ha", "procent"])
+    for k in ["PRZEPUSZCZALNE", "NIEPRZEPUSZCZALNE", "WODA"]:
+        procent = round((suma[k] / pow_calk) * 100, 2) if pow_calk > 0 else 0
+        writer.writerow([k, str(round(suma[k], 2)).replace(".", ","), str(procent).replace(".", ",")])
+
+print("Gotowe! Wynik powiatowy zapisany:", csv_out)
